@@ -72,7 +72,7 @@ func readFiles(ctx context.Context, path string, files []os.FileInfo, log *logru
 	return jsonFiles, nil
 }
 
-//TODO: @shawn-hurley Add errors for these methods to validate that the correct struct values are set.
+// TODO: @shawn-hurley Add errors for these methods to validate that the correct struct values are set.
 type PathOpts struct {
 	TransformDir      string
 	ExportDir         string
@@ -103,6 +103,7 @@ func (opts *PathOpts) updateIgnoredPatchesDirPath(prefix, filePath string) strin
 	return opts.updatePath(opts.IgnoredPatchesDir, prefix, filePath)
 }
 
+// NOTE TO SELF - REPORT IF INVALID PATH.
 func (opts *PathOpts) updatePath(updateDir, prefix, filePath string) string {
 	dir, fname := filepath.Split(filePath)
 	dir = strings.Replace(dir, opts.ExportDir, updateDir, 1)
