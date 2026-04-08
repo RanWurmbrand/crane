@@ -1,254 +1,504 @@
-# Guide 3: Transfer-PVC Command — Multi-Cluster Operations
+# Guide 3: Transfer-PVC Command — Multi-Cluster Data Migration
 
-You'll write unit tests for the `transfer-pvc` command. This command copies data between two Kubernetes clusters using rsync.
+You'll write unit tests for the `transfer-pvc` command. This command transfers PVC (Persistent Volume Claim) data from one Kubernetes cluster to another.
 
 By the end, you'll know:
-- What PersistentVolumeClaims (PVCs) are
-- How multi-cluster operations work
-- How to parse and test rsync log output
-- Advanced testing patterns for complex state
+- What PVCs are and why you'd transfer them
+- How multi-cluster operations work (kubeconfig and contexts)
+- How crane maps source names to destination names
+- How command-line flags become struct values
+- How to parse and validate user input
+- How to test progress tracking and status logic
 
 ---
 
-## Part 1: What is a PersistentVolumeClaim?
+## Part 1: What is a PVC?
 
-**Why you need to know this:** The entire command is about transferring PVC data. You can't test it without understanding what PVCs are.
-
----
-
-### 1.1 The Problem PVCs Solve
-
-Containers are temporary. When a container restarts, any files it created are gone. But applications need to store data that survives restarts — databases, uploads, logs.
-
-Kubernetes solves this with "volumes" — storage that exists outside the container and survives restarts.
+**Why you need to know this:** The transfer command moves PVC data. You need to understand what you're moving.
 
 ---
 
-### 1.2 How Storage Works in Kubernetes
+### 1.1 Storage in Kubernetes
 
-Three concepts work together:
+In Guide 2, you learned about ConfigMaps and Secrets — they store configuration. But what about actual data? Database files, uploaded images, logs?
 
-1. **PersistentVolume (PV)** — A piece of actual storage (disk space on a server, cloud storage, network drive)
-2. **PersistentVolumeClaim (PVC)** — A request for storage. Your application says "I need 10GB of fast storage"
-3. **StorageClass** — Defines what kind of storage is available (fast SSD, slow HDD, network storage)
+Kubernetes has a storage system for this. Three concepts:
+
+**PersistentVolume (PV)** — A piece of storage in the cluster. Think of it as a hard drive. It exists independently of any Pod.
+
+**PersistentVolumeClaim (PVC)** — A request for storage. A Pod says "I need 10GB of storage" by creating a PVC. Kubernetes finds a matching PV and binds them together.
+
+**StorageClass** — Defines what kind of storage to provision. "Fast SSD" vs "cheap spinning disk" vs "network storage."
 
 The flow:
-1. You create a PVC: "I need 10GB"
-2. Kubernetes finds or creates a PV that matches
-3. Your Pod mounts the PVC and reads/writes files to it
+1. Admin creates a StorageClass (or uses a default one)
+2. User creates a PVC requesting storage
+3. Kubernetes provisions a PV and binds it to the PVC
+4. Pod mounts the PVC and reads/writes data
 
 ---
 
-### 1.3 Why Transfer PVCs?
+### 1.2 Why Transfer PVCs?
 
-When migrating applications between clusters, you need to:
-1. Export the Kubernetes resource definitions (what you did with the export command)
-2. Transfer the actual data stored in PVCs
+When migrating an application to a new cluster, you need its data too.
 
-The transfer-pvc command handles step 2. It:
-1. Connects to the source cluster, finds the PVC
-2. Creates an equivalent PVC on the destination cluster
-3. Uses rsync to copy files from source to destination
+Example: You have a PostgreSQL database in Cluster A. The database stores data in a PVC. You want to move the whole application to Cluster B.
+
+You can export the Kubernetes resource definitions (Deployments, Services, ConfigMaps) with the `export` command from Guide 2. But the actual database files — the bytes on disk — don't come with the YAML. That's what `transfer-pvc` does: it copies the actual data.
 
 ---
 
-### 1.4 The PVC Data Structure
+### 1.3 How Transfer Works (High Level)
 
-In Go, a PVC is represented by `corev1.PersistentVolumeClaim`:
+The command:
+1. Reads the source PVC definition
+2. Creates a matching PVC in the destination cluster
+3. Sets up encrypted network tunnel between clusters
+4. Uses `rsync` to copy all files from source to destination (we'll explain rsync in Part 6)
+5. Reports progress in real-time
+6. Cleans up temporary resources
 
-```go
-type PersistentVolumeClaim struct {
-    metav1.TypeMeta
-    metav1.ObjectMeta     // name, namespace, labels
-    Spec   PersistentVolumeClaimSpec
-    Status PersistentVolumeClaimStatus
-}
-
-type PersistentVolumeClaimSpec struct {
-    AccessModes      []PersistentVolumeAccessMode  // ReadWriteOnce, ReadOnlyMany, etc.
-    Resources        ResourceRequirements          // how much storage requested
-    StorageClassName *string                       // which StorageClass to use
-    VolumeName       string                        // specific PV to bind to
-    // ... more fields
-}
-```
-
-Key fields:
-- **Name/Namespace** — Identifies the PVC
-- **AccessModes** — Can multiple pods read? Can they write? `ReadWriteOnce` = one pod can read and write
-- **Resources.Requests** — How much storage (e.g., "10Gi")
-- **StorageClassName** — What type of storage
+You don't need to understand all the networking details. For testing, you'll focus on:
+- Parsing user input (names, namespaces, flags)
+- Progress tracking (parsing rsync output)
+- Validation logic
 
 ---
 
 ## Part 2: Multi-Cluster Architecture
 
-**Why you need to know this:** The command works with two clusters simultaneously.
+**Why you need to know this:** The command works with two clusters simultaneously. You need to understand how it connects to both.
 
 ---
 
 ### 2.1 Kubeconfig and Contexts
 
-When you interact with Kubernetes, you use a config file (`~/.kube/config` by default). This file can contain:
-- Multiple clusters (URLs to connect to)
-- Multiple users (credentials)
-- Multiple contexts (cluster + user + default namespace)
+Kubernetes runs on a server. To talk to it, your computer needs to know:
+- **Where** — The server's address (like `https://my-cluster.example.com:6443`)
+- **Who you are** — A certificate or token that proves your identity
 
-A "context" is a shortcut: instead of specifying cluster, user, and namespace every time, you say "use context X."
+This information is stored in a config file, usually at `~/.kube/config`. Tools like `kubectl` (the Kubernetes command-line tool) and crane read this file to connect.
+
+The config file can contain multiple clusters. To avoid typing the address and credentials every time, you create **contexts**. A context is a saved combination of:
+- Which cluster to connect to
+- Which credentials to use
+- Which namespace to use by default
+
+You give each context a name like "production" or "staging", then just say "use context production" instead of specifying everything.
 
 ---
 
 ### 2.2 How Transfer-PVC Uses Contexts
 
-The command takes two flags:
-- `--source-context` — The context for the cluster to copy FROM
-- `--destination-context` — The context for the cluster to copy TO
+Example:
+```bash
+crane transfer-pvc \
+  --source-context cluster-a \
+  --destination-context cluster-b \
+  --pvc-name my-data
+```
 
-It creates two separate clients — one for each cluster — and orchestrates the transfer.
+This tells crane:
+- `--source-context cluster-a` — Connect to the cluster saved as "cluster-a" to read data
+- `--destination-context cluster-b` — Connect to the cluster saved as "cluster-b" to write data
+
+Crane connects to both clusters simultaneously — reading from source, writing to destination.
 
 ---
 
-### 2.3 The TransferPVCCommand Struct
+## Part 3: Mapping Source to Destination
 
-**Open:** `cmd/transfer-pvc/transfer-pvc.go`
-
-```go
-type TransferPVCCommand struct {
-    configFlags *genericclioptions.ConfigFlags
-    genericclioptions.IOStreams
-    logger logrus.FieldLogger
-
-    sourceContext      *clientcmdapi.Context
-    destinationContext *clientcmdapi.Context
-
-    Flags
-}
-```
-
-Fields explained:
-- **configFlags** — Helper to read kubeconfig
-- **IOStreams** — Standard input/output streams (for logging)
-- **logger** — Logging interface
-- **sourceContext** — The parsed source context
-- **destinationContext** — The parsed destination context
-- **Flags** — Command-line options (embedded struct)
+The user might want different names in source and destination. The command supports a mapping format.
 
 ---
 
-### 2.4 The Flags Struct
+### 3.1 The Problem
 
-```go
-type Flags struct {
-    PVC                PvcFlags
-    Endpoint           EndpointFlags
-    SourceContext      string
-    DestinationContext string
-    SourceImage        string
-    DestinationImage   string
-    Verify             bool
-    RsyncFlags         []string
-    ProgressOutput     string
-}
+User has a PVC named `database-data` in namespace `production` on Cluster A.
+
+They want to create it as `db-data` in namespace `staging` on Cluster B.
+
+The command needs to accept:
+- Source PVC name: `database-data`
+- Destination PVC name: `db-data`
+- Source namespace: `production`
+- Destination namespace: `staging`
+
+---
+
+### 3.2 The Mapping Format
+
+**Why you need to know this:** You'll test the parsing function that handles this format.
+
+The user provides mappings in format `source:destination`:
+
+```bash
+crane transfer-pvc \
+  --pvc-name database-data:db-data \
+  --pvc-namespace production:staging \
+  --source-context cluster-a \
+  --destination-context cluster-b
 ```
 
-Nested structs:
+If source and destination are the same, just one value works:
 
-```go
-type PvcFlags struct {
-    Name             mappedNameVar   // source:destination mapping
-    Namespace        mappedNameVar   // source:destination mapping
-    StorageClassName string
-    StorageRequests  quantityVar     // storage amount
-}
-
-type EndpointFlags struct {
-    Type         endpointType    // "nginx-ingress" or "route"
-    Subdomain    string
-    IngressClass string
-}
+```bash
+--pvc-name database-data
+# same as: --pvc-name database-data:database-data
 ```
 
 ---
 
-## Part 3: Study the Existing Tests
+### 3.3 The mappedNameVar Struct
 
-Before writing new tests, understand the existing ones.
+**Why you need to know this:** This struct stores the parsed mapping. The function you'll test populates it.
+
+```go
+type mappedNameVar struct {
+    source      string
+    destination string
+}
+```
+
+Two fields:
+- **source** — The name in the source cluster
+- **destination** — The name in the destination cluster
 
 ---
 
-### 3.1 Test for parseSourceDestinationMapping
+### 3.4 The parseSourceDestinationMapping Function
+
+**Why you need to know this:** This is the function that parses the `source:destination` format from 3.2 and returns values that populate the `mappedNameVar` struct from 3.3.
+
+**Open:** `cmd/transfer-pvc/transfer-pvc.go`, find `parseSourceDestinationMapping`
+
+```go
+func parseSourceDestinationMapping(mapping string) (source string, destination string, err error) {
+    split := strings.Split(string(mapping), ":")
+    switch len(split) {
+    case 1:
+        if split[0] == "" {
+            return "", "", fmt.Errorf("source name cannot be empty")
+        }
+        return split[0], split[0], nil
+    case 2:
+        if split[1] == "" || split[0] == "" {
+            return "", "", fmt.Errorf("source or destination name cannot be empty")
+        }
+        return split[0], split[1], nil
+    default:
+        return "", "", fmt.Errorf("invalid name mapping. must be of format <source>:<destination>")
+    }
+}
+```
+
+The function:
+1. Splits the input by `:`
+2. If one part: use it for both source and destination
+3. If two parts: first is source, second is destination
+4. Otherwise: error
+
+---
+
+### 3.5 Existing Tests
 
 **Open:** `cmd/transfer-pvc/transfer-pvc_test.go`
 
-This tests a pure function that parses strings like "source:destination" into two separate values.
+This function already has tests. Read them to understand the test structure used in this package.
+
+Notice:
+- Table-driven tests with descriptive names
+- Tests for valid inputs AND invalid inputs
+- Each test case checks both the returned values and the error
+
+---
+
+### 3.6 Add More Edge Cases
+
+The existing tests are good, but they miss some cases.
+
+**What to do:**
+
+1. Open `cmd/transfer-pvc/transfer-pvc_test.go`
+2. Add test cases to the existing `Test_parseSourceDestinationMapping` function:
+   - Input with spaces: `"source name:dest name"` — should this work? Test it and see what happens.
+   - Input with special characters: `"my-pvc_v1:my-pvc_v2"` — PVC names can have hyphens and underscores.
+
+3. Run: `go test ./cmd/transfer-pvc/... -run Test_parseSourceDestinationMapping -v`
+
+---
+
+## Part 4: Resource Name Validation
+
+Kubernetes has rules about resource names. They can't be too long.
+
+---
+
+### 4.1 The Problem
+
+A user tries to transfer a PVC with a very long name: `my-very-long-application-name-with-lots-of-descriptive-words-database-primary-replica-backup`.
+
+That's 89 characters. Kubernetes resource names must be 63 characters or fewer (DNS label restrictions). The transfer would fail when trying to create resources with this name.
+
+How does crane handle this?
+
+---
+
+### 4.2 The getValidatedResourceName Function
+
+**Why you need to know this:** This function solves the problem from 4.1 — it ensures names fit the 63-character limit.
 
 ```go
-func Test_parseSourceDestinationMapping(t *testing.T) {
-    tests := []struct {
-        name            string
-        mapping         string
-        wantSource      string
-        wantDestination string
-        wantErr         bool
-    }{
-        // test cases...
-    }
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            gotSource, gotDestination, err := parseSourceDestinationMapping(tt.mapping)
-            // assertions...
-        })
+func getValidatedResourceName(name string) string {
+    if len(name) < 63 {
+        return name
+    } else {
+        return fmt.Sprintf("crane-%x", md5.Sum([]byte(name)))
     }
 }
 ```
 
-Notice the pattern:
-- Table-driven test with named cases
-- `t.Run(tt.name, ...)` — Creates a subtest for each case
-- Tests both successful parsing AND error cases
+The function:
+1. If the name is under 63 characters, return it unchanged
+2. Otherwise, create a hash-based name: `crane-` followed by the MD5 hash
+
+**What is MD5?** It's a function that takes any input and produces a fixed-length output (32 hex characters). The same input always produces the same output. Different inputs produce different outputs. So `crane-` plus 32 hex characters = 38 characters, well under 63.
+
+Example: A 100-character name becomes something like `crane-5d41402abc4b2a76b9719d911017c592`.
 
 ---
 
-### 3.2 What t.Run Does
+### 4.3 Write the Test
 
-**Why you need to know this:** The existing tests use subtests. You'll use them too.
+**What to do:**
 
-`t.Run(name, func(t *testing.T) {...})` creates a subtest with its own name. Benefits:
-- Each case shows separately in output
-- A failure in one case doesn't stop other cases
-- You can run a specific case: `go test -run TestName/casename`
+1. In `cmd/transfer-pvc/transfer-pvc_test.go`, add a test function for `getValidatedResourceName`
+2. Test cases to cover:
+   - Short name (under 63 chars): should return unchanged
+   - Exactly 62 characters: should return unchanged
+   - Exactly 63 characters: look at the condition (`< 63`), so 63 triggers the hash
+   - Long name (100 characters): should return hashed version starting with `crane-`
+   - Same long name twice: should return the same hash (deterministic)
+   - Two different long names: should return different hashes
+3. For creating test strings of exact length, use the `strings.Repeat` function
+4. For checking the result, verify it starts with `crane-` and is not longer than 63 characters
+5. Run: `go test ./cmd/transfer-pvc/... -run Test_getValidatedResourceName -v`
 
 ---
 
-### 3.3 Testing Functions That Return Errors
+## Part 5: Validation Functions
 
-Look at how the test handles errors:
+What happens if the user forgets to provide required flags? Or provides invalid combinations? The command should fail early with a clear error, not crash halfway through a transfer.
+
+---
+
+### 5.1 The EndpointFlags Struct
+
+**Why you need to know this:** You'll test this struct's validation method.
+
+**Open:** `cmd/transfer-pvc/transfer-pvc.go`, find `EndpointFlags`.
 
 ```go
-if (err != nil) != tt.wantErr {
-    t.Errorf("parseSourceDestinationMapping() error = %v, wantErr %v", err, tt.wantErr)
-    return
+type EndpointFlags struct {
+    Type         endpointType  // "nginx-ingress" or "route"
+    Subdomain    string        // Required for nginx-ingress
+    IngressClass string        // Optional ingress class
 }
 ```
 
-This pattern:
-- `(err != nil)` — True if there WAS an error
-- `tt.wantErr` — True if we EXPECTED an error
-- If these don't match, the test fails
-
-The `return` after `t.Errorf` stops checking other assertions if the error expectation was wrong.
+Three fields:
+- **Type** — Which endpoint type to use
+- **Subdomain** — The subdomain for the ingress (e.g., "my-app.example.com")
+- **IngressClass** — Optional: which ingress class to use (e.g., "nginx", "traefik", "haproxy")
 
 ---
 
-## Part 4: Test parseRsyncLogs
+### 5.2 The endpointType Custom Type
 
-This function parses rsync output to extract progress information. It's complex but testable.
+**Why you need to know this:** The `Type` field uses this custom type. You need to understand what values it can have.
+
+```go
+type endpointType string
+
+const (
+    endpointNginx endpointType = "nginx-ingress"
+    endpointRoute endpointType = "route"
+)
+```
+
+This is a custom string type with two allowed values:
+- `endpointNginx` — the string "nginx-ingress" (uses Kubernetes Ingress)
+- `endpointRoute` — the string "route" (uses OpenShift Routes)
 
 ---
 
-### 4.1 Understand What Rsync Outputs
+### 5.3 The EndpointFlags.Validate Method
 
-Rsync is a file synchronization tool. When running, it outputs progress like:
+**Why you need to know this:** This is the method you'll test.
+
+```go
+func (e EndpointFlags) Validate() error {
+    if e.Type == "" {
+        e.Type = endpointNginx
+    }
+    switch e.Type {
+    case endpointNginx:
+        if e.Subdomain == "" {
+            return fmt.Errorf("subdomain cannot be empty when using nginx ingress")
+        }
+    }
+    return nil
+}
+```
+
+The logic:
+1. Default to nginx-ingress if type is empty
+2. If nginx-ingress, subdomain is required
+3. Routes don't need a subdomain
+
+---
+
+### 5.4 Write the Test for EndpointFlags.Validate
+
+**What to do:**
+
+1. Add a test function for `EndpointFlags.Validate` to the test file
+2. Test cases to cover:
+   - nginx-ingress with subdomain: should return nil (valid)
+   - nginx-ingress without subdomain: should return error
+   - route without subdomain: should return nil (valid)
+   - route with subdomain: should return nil (subdomain is ignored, not an error)
+   - empty type with subdomain: should return nil (defaults to nginx-ingress, which needs subdomain — this satisfies it)
+   - empty type without subdomain: should return error (defaults to nginx-ingress, which needs subdomain)
+3. Run: `go test ./cmd/transfer-pvc/... -run Test_EndpointFlags_Validate -v`
+
+---
+
+### 5.5 The PvcFlags Struct
+
+**Why you need to know this:** You'll test this struct's validation method.
+
+**Open:** `cmd/transfer-pvc/transfer-pvc.go`, find `PvcFlags`.
+
+```go
+type PvcFlags struct {
+    Name             mappedNameVar  // source:destination PVC names (from Part 3)
+    Namespace        mappedNameVar  // source:destination namespaces
+    StorageClassName string         // Optional: storage class for destination
+    StorageRequests  quantityVar    // Optional: storage size
+}
+```
+
+Four fields:
+- **Name** — The PVC name mapping (uses `mappedNameVar` you learned in Part 3)
+- **Namespace** — The namespace mapping (same type)
+- **StorageClassName** — Optional: override the storage class in destination
+- **StorageRequests** — Optional: override the storage size
+
+---
+
+### 5.6 The quantityVar Custom Type
+
+**Why you need to know this:** The `StorageRequests` field uses this type. You need to understand what it is.
+
+```go
+type quantityVar struct {
+    quantity *resource.Quantity
+}
+```
+
+This wraps a Kubernetes `resource.Quantity` — a type that represents amounts like "10Gi" (10 gibibytes), "500Mi" (500 mebibytes), etc. Kubernetes uses this for storage sizes, memory limits, and CPU requests.
+
+The pointer means it can be nil (not set by user).
+
+---
+
+### 5.7 The PvcFlags.Validate Method
+
+**Why you need to know this:** This is the method you'll test.
+
+```go
+func (p *PvcFlags) Validate() error {
+    if p.Name.source == "" {
+        return fmt.Errorf("source pvc name cannot be empty")
+    }
+    if p.Name.destination == "" {
+        return fmt.Errorf("destnation pvc name cannot be empty")
+    }
+    if p.Namespace.source == "" {
+        return fmt.Errorf("source pvc namespace cannot be empty")
+    }
+    if p.Namespace.destination == "" {
+        return fmt.Errorf("destination pvc namespace cannot be empty")
+    }
+    return nil
+}
+```
+
+All four fields must be non-empty: source name, destination name, source namespace, destination namespace.
+
+---
+
+### 5.8 Write the Test for PvcFlags.Validate
+
+**What to do:**
+
+1. Add a test function for `PvcFlags.Validate`
+2. Test cases to cover:
+   - All fields set: should return nil
+   - Missing source name: should return error containing "source pvc name"
+   - Missing destination name: should return error containing "destnation" (note the typo in the code — test what the code actually does)
+   - Missing source namespace: should return error
+   - Missing destination namespace: should return error
+   - Only names set, no namespaces: should return error (check which error comes first)
+3. Run: `go test ./cmd/transfer-pvc/... -run Test_PvcFlags_Validate -v`
+
+---
+
+### 5.9 How Flags Become Struct Values
+
+**Why you need to know this:** Now that you've tested validation, here's context on how user input gets into these structs.
+
+When you run:
+```bash
+crane transfer-pvc --pvc-name database:db --endpoint nginx-ingress
+```
+
+The CLI framework (Cobra) does the following:
+
+1. Parses the command line and extracts flag values
+2. For `--pvc-name database:db`, calls `parseSourceDestinationMapping` (which you tested in Part 3)
+3. Stores the result in a struct field
+4. Before running the transfer, calls `Validate()` on each struct — this is what you just tested
+
+The tests you wrote create structs directly and call `Validate()`. You're testing step 4, not the parsing steps.
+
+---
+
+## Part 6: Progress Tracking
+
+When transferring gigabytes of data, the user needs to know: How much is done? How fast? Are there errors? The transfer shows real-time progress by parsing output from the tool that copies the files.
+
+---
+
+### 6.1 What is rsync?
+
+**Why you need to know this:** The progress parser reads rsync output. You need to understand what it's parsing.
+
+**Rsync** is a command-line tool that copies files between two locations. It's commonly used for backups and transfers because:
+- It only copies files that changed (efficient)
+- It can resume interrupted transfers
+- It works over the network
+
+Crane uses rsync to copy data from the source PVC to the destination PVC. While rsync runs, it prints progress information that crane parses.
+
+---
+
+### 6.2 Rsync Output Format
+
+**Why you need to know this:** This is what the parser reads. You need to understand the format to test parsing.
+
+When running, rsync outputs progress like:
 
 ```
 16.78M   3%  105.06MB/s    0:00:00 (xfr#1, to-chk=19/21)
@@ -259,7 +509,7 @@ This line means:
 - `33.55M` — 33.55 megabytes transferred so far
 - `6%` — 6% complete
 - `86.40MB/s` — Current transfer speed
-- `(xfr#2, to-chk=18/21)` — Transferred 2 files, 18 of 21 remaining
+- `(xfr#2, to-chk=18/21)` — Transferred 2 files, 18 of 21 left to check. Rsync checks each file as it goes — if it's already up to date, no transfer needed. So 3 files checked, 2 transferred, 1 was already up to date.
 
 When rsync finishes, it outputs stats:
 ```
@@ -268,255 +518,30 @@ Number of regular files transferred: 130
 Total transferred file size: 8.67G bytes
 ```
 
----
-
-### 4.2 The Progress Struct
-
-**Open:** `cmd/transfer-pvc/progress.go`
-
-```go
-type Progress struct {
-    PVC                types.NamespacedName `json:"pvc"`
-    TransferPercentage *int64               `json:"transferPercentage"`
-    TransferRate       *dataSize            `json:"transferRate"`
-    TransferredData    *dataSize            `json:"transferredData"`
-    TotalFiles         *int64               `json:"totalFiles"`
-    TransferredFiles   int64                `json:"transferredFiles"`
-    ExitCode           *int32               `json:"exitCode"`
-    FailedFiles        []FailedFile         `json:"failedFiles"`
-    Errors             []string             `json:"miscErrors"`
-    retries            *int
-    startedAt          time.Time
-}
-```
-
-Fields explained:
-- **PVC** — Which PVC is being transferred
-- **TransferPercentage** — How far along (0-100). Pointer because it might be unknown (nil)
-- **TransferRate** — Speed of transfer (e.g., "86.40 MB/s")
-- **TransferredData** — Total data transferred so far
-- **TotalFiles** — Number of files to transfer
-- **TransferredFiles** — How many files transferred so far
-- **ExitCode** — rsync exit code when done. 0 = success
-- **FailedFiles** — Files that failed to transfer
-- **Errors** — Other errors that occurred
+The progress parser extracts these values from the text output.
 
 ---
 
-### 4.3 Why Are Some Fields Pointers?
+### 6.3 The dataSize Struct
 
-Look at `TransferPercentage *int64` vs `TransferredFiles int64`.
-
-`*int64` is a pointer. It can be:
-- `nil` — We don't know the value yet
-- A pointer to an actual number
-
-`int64` (no pointer) always has a value. In Go, uninitialized integers are 0.
-
-Using pointers lets you distinguish "we know it's 0" from "we don't know yet."
-
-In the Progress struct:
-- `TransferPercentage *int64` — We don't know until rsync reports it
-- `TransferredFiles int64` — Starts at 0, which is meaningful (0 files transferred)
-
----
-
-### 4.4 The dataSize Struct
+**Why you need to know this:** This struct represents data amounts like "33.55 MB". The parsing functions use it.
 
 ```go
 type dataSize struct {
-    val  float64
-    unit string
+    val  float64  // The number (33.55)
+    unit string   // The unit ("M", "G", "K", "bytes")
 }
 ```
 
-Represents amounts like "33.55M" or "8.67G":
-- `val` — The numeric part (33.55)
-- `unit` — The unit ("M" for megabytes, "G" for gigabytes)
+Two fields:
+- **val** — The numeric value as a decimal number
+- **unit** — The unit string ("M" for megabytes, "G" for gigabytes, etc.)
 
 ---
 
-### 4.5 Study the Existing Test
+### 6.4 The newDataSize Function
 
-**Open:** `cmd/transfer-pvc/progress_test.go`
-
-```go
-func Test_parseRsyncLogs(t *testing.T) {
-    int130 := int64(130)
-    // ... more variables
-    tests := []struct {
-        name            string
-        stdout          string
-        stderr          string
-        want            Progress
-        wantStatus      status
-        wantUnProcessed string
-    }{
-        // test cases...
-    }
-    // loop and assertions...
-}
-```
-
-Notice:
-- Variables like `int130 := int64(130)` are created outside the test cases. This is because you can't take the address of a literal (`&130` doesn't work), but you can take the address of a variable (`&int130`).
-- The test cases include raw rsync output as multiline strings
-- Helper functions `intEqual` and `dataEqual` handle nil comparisons
-
----
-
-### 4.6 Write Your Own Test Case
-
-**What to do:**
-
-1. Open `cmd/transfer-pvc/progress_test.go`
-2. Add a new test case to the `tests` slice in `Test_parseRsyncLogs`
-3. Test this scenario: rsync reports an error for a file
-
-   Use this raw output:
-   ```
-   rsync: [sender] send_files failed to open "/data/secret.txt": Permission denied (13)
-   ```
-
-4. Your expected `Progress` should have:
-   - One entry in `FailedFiles` with Name="/data/secret.txt" and Err="Permission denied (13)"
-
-5. Run: `go test ./cmd/transfer-pvc/... -run Test_parseRsyncLogs -v`
-
----
-
-## Part 5: Test the Status Method
-
-The `Status()` method returns the current state based on Progress fields.
-
----
-
-### 5.1 Understand the Status Logic
-
-```go
-type status string
-
-const (
-    succeeded          status = "Succeeded"
-    failed             status = "Failed"
-    partiallyFailed    status = "Partially failed"
-    preparing          status = "Preparing"
-    transferInProgress status = "Transfer in-progress"
-    finishingUp        status = "Finishing up"
-)
-
-func (p *Progress) Status() status {
-    if p.ExitCode != nil {
-        if *p.ExitCode == 0 {
-            return succeeded
-        }
-        if p.TransferredFiles == 0 &&
-            p.TransferredData.val == 0 &&
-            p.TotalFiles == nil {
-            return failed
-        }
-        return partiallyFailed
-    } else {
-        if p.TransferPercentage == nil {
-            return preparing
-        }
-        if *p.TransferPercentage >= 100 {
-            return finishingUp
-        }
-    }
-    return transferInProgress
-}
-```
-
-The logic:
-- If ExitCode is set:
-  - 0 = succeeded
-  - Non-zero with no progress = failed
-  - Non-zero with some progress = partiallyFailed
-- If ExitCode is not set:
-  - No percentage yet = preparing
-  - 100% = finishingUp
-  - Otherwise = transferInProgress
-
----
-
-### 5.2 Write Status Tests
-
-**What to do:**
-
-1. Create a new test function `TestProgress_Status(t *testing.T)` in `progress_test.go`
-2. Test cases to include:
-   - ExitCode 0: expect succeeded
-   - ExitCode non-zero, no files transferred: expect failed
-   - ExitCode non-zero, some files transferred: expect partiallyFailed
-   - No ExitCode, no percentage: expect preparing
-   - No ExitCode, percentage 100: expect finishingUp
-   - No ExitCode, percentage 50: expect transferInProgress
-
-3. For each case, create a `Progress` struct with appropriate fields set
-4. Call `p.Status()` and compare to expected status
-
-5. Run: `go test ./cmd/transfer-pvc/... -run TestProgress_Status -v`
-
----
-
-## Part 6: Test addDataSize
-
-This function adds two dataSize values, handling unit conversions.
-
----
-
-### 6.1 Understand the Function
-
-```go
-func addDataSize(a, b *dataSize) *dataSize {
-    if b == nil {
-        return nil
-    }
-    newDs := &dataSize{}
-    units := map[string]int{"bytes": 0, "K": 3, "M": 6, "G": 9, "T": 12}
-    if b.unit == a.unit {
-        newDs.val = b.val + a.val
-        newDs.unit = b.unit
-    } else {
-        // unit conversion logic...
-    }
-    return newDs
-}
-```
-
-The `units` map stores the power of 10 for each unit:
-- "bytes" = 10^0 = 1
-- "K" = 10^3 = 1,000
-- "M" = 10^6 = 1,000,000
-- etc.
-
-When units differ, it converts to the larger unit.
-
----
-
-### 6.2 Write addDataSize Tests
-
-**What to do:**
-
-1. Create `TestAddDataSize(t *testing.T)` in `progress_test.go`
-2. Test cases:
-   - Same units: 10M + 5M = 15M
-   - Different units: 500K + 1M = 1.5M (approximately)
-   - Nil input: expect nil output
-   - Zero values
-
-3. Run: `go test ./cmd/transfer-pvc/... -run TestAddDataSize -v`
-
----
-
-## Part 7: Test newDataSize
-
-This function parses strings like "33.55M" into dataSize structs.
-
----
-
-### 7.1 Understand the Function
+**Why you need to know this:** This function parses strings like "33.55M" into the `dataSize` struct from 6.3. You'll test this function.
 
 ```go
 func newDataSize(str string) *dataSize {
@@ -540,219 +565,365 @@ func newDataSize(str string) *dataSize {
 }
 ```
 
-The regex `([\d\.]+)([\w\/]*)`:
-- `([\d\.]+)` — Captures digits and dots (the number)
-- `([\w\/]*)` — Captures word characters and slashes (the unit, like "MB/s")
+The function:
+1. Uses a regex pattern to extract the number and unit parts
+2. Parses the number as float64
+3. Defaults unit to "bytes" if none provided
+4. Returns nil if parsing fails
 
 ---
 
-### 7.2 Write newDataSize Tests
+### 6.5 Write Test for newDataSize
 
 **What to do:**
 
-1. Create `TestNewDataSize(t *testing.T)` in `progress_test.go`
-2. Test cases:
-   - "33.55M" → val: 33.55, unit: "M"
-   - "8.67G" → val: 8.67, unit: "G"
-   - "86.40MB/s" → val: 86.40, unit: "MB/s"
-   - "100" → val: 100, unit: "bytes" (default)
-   - "invalid" → nil
-   - "" → nil
-
-3. Run: `go test ./cmd/transfer-pvc/... -run TestNewDataSize -v`
-
----
-
-## Part 8: Test getValidatedResourceName
-
-A simpler function that validates resource names.
+1. In `cmd/transfer-pvc/progress_test.go`, add a test function for `newDataSize`
+2. Test cases to cover:
+   - "33.55M": should return val=33.55, unit="M"
+   - "100G": should return val=100, unit="G"
+   - "1024K": should return val=1024, unit="K"
+   - "86.40MB/s": should return val=86.40, unit="MB/s" (rate includes /s)
+   - "1024": should return val=1024, unit="bytes" (no unit defaults to bytes)
+   - "": should return nil
+   - "abc": should return nil (no number to parse)
+3. Run: `go test ./cmd/transfer-pvc/... -run Test_newDataSize -v`
 
 ---
 
-### 8.1 Understand the Function
+### 6.6 The addDataSize Function
+
+**Why you need to know this:** When a transfer fails and retries, progress from multiple attempts needs to be combined. This function adds two `dataSize` values together, handling unit conversion.
 
 ```go
-func getValidatedResourceName(name string) string {
-    if len(name) < 63 {
-        return name
+func addDataSize(a, b *dataSize) *dataSize {
+    if b == nil {
+        return nil
+    }
+    newDs := &dataSize{}
+    units := map[string]int{"bytes": 0, "K": 3, "M": 6, "G": 9, "T": 12}
+    if b.unit == a.unit {
+        newDs.val = b.val + a.val
+        newDs.unit = b.unit
     } else {
-        return fmt.Sprintf("crane-%x", md5.Sum([]byte(name)))
-    }
-}
-```
-
-Kubernetes resource names must be 63 characters or less. If the name is too long, it creates a hash-based name.
-
----
-
-### 8.2 Write the Test
-
-**What to do:**
-
-1. Add `TestGetValidatedResourceName(t *testing.T)` to `transfer-pvc_test.go`
-2. Test cases:
-   - Short name (under 63 chars): returns unchanged
-   - Exactly 62 chars: returns unchanged
-   - Exactly 63 chars: returns hash-based name
-   - Long name (over 63 chars): returns hash-based name
-
-3. Verify the hash-based name:
-   - Starts with "crane-"
-   - Is deterministic (same input = same output)
-
-4. Run: `go test ./cmd/transfer-pvc/... -run TestGetValidatedResourceName -v`
-
----
-
-## Part 9: Testing Functions That Need Clients (Advanced)
-
-Some functions require a Kubernetes client. These are harder to test.
-
----
-
-### 9.1 Functions That Need Mocking
-
-These functions call `client.Get`, `client.List`, etc.:
-- `getNodeNameForPVC` — Lists pods to find which node has the PVC
-- `getIDsForNamespace` — Gets namespace to read security annotations
-- `getRsyncClientPodSecurityContext` — Uses getIDsForNamespace
-- `getRsyncServerPodSecurityContext` — Uses getIDsForNamespace
-
----
-
-### 9.2 Using controller-runtime Fake Client
-
-The controller-runtime library provides a fake client:
-
-```go
-import (
-    "sigs.k8s.io/controller-runtime/pkg/client/fake"
-    "k8s.io/client-go/kubernetes/scheme"
-)
-
-// Create fake client with pre-populated objects
-fakeClient := fake.NewClientBuilder().
-    WithScheme(scheme.Scheme).
-    WithObjects(existingPod, existingNamespace).
-    Build()
-
-// Use it like a real client
-err := fakeClient.Get(context.TODO(), key, &result)
-```
-
----
-
-### 9.3 Test getNodeNameForPVC (Optional Advanced Exercise)
-
-**What to do:**
-
-1. Create `TestGetNodeNameForPVC(t *testing.T)` in `transfer-pvc_test.go`
-2. Import fake client: `"sigs.k8s.io/controller-runtime/pkg/client/fake"`
-3. Create a fake pod that:
-   - Has Status.Phase = Running
-   - Has a Volume with PersistentVolumeClaim.ClaimName matching your test PVC
-   - Has Spec.NodeName set to a test value
-
-4. Create the fake client with this pod
-5. Call `getNodeNameForPVC(fakeClient, namespace, pvcName)`
-6. Verify it returns the expected node name
-
-This is complex. If you're not comfortable yet, skip to the summary and return later.
-
----
-
-## Part 10: Test Validation Methods
-
-The `Validate()` methods check that required fields are set.
-
----
-
-### 10.1 Test PvcFlags.Validate
-
-**Open:** `cmd/transfer-pvc/transfer-pvc.go`, find `PvcFlags.Validate()`
-
-```go
-func (p *PvcFlags) Validate() error {
-    if p.Name.source == "" {
-        return fmt.Errorf("source pvc name cannot be empty")
-    }
-    // more checks...
-    return nil
-}
-```
-
-**What to do:**
-
-1. Add `TestPvcFlags_Validate(t *testing.T)` to `transfer-pvc_test.go`
-2. Test cases:
-   - All fields valid: expect nil error
-   - Empty source name: expect error containing "source pvc name"
-   - Empty destination name: expect error containing "destination pvc name"
-   - Empty source namespace: expect error
-   - Empty destination namespace: expect error
-
-3. To check error messages, use `strings.Contains`:
-   ```go
-   if err == nil || !strings.Contains(err.Error(), "expected text") {
-       t.Errorf("expected error containing 'expected text'")
-   }
-   ```
-
-4. Run: `go test ./cmd/transfer-pvc/... -run TestPvcFlags_Validate -v`
-
----
-
-### 10.2 Test EndpointFlags.Validate
-
-```go
-func (e EndpointFlags) Validate() error {
-    if e.Type == "" {
-        e.Type = endpointNginx
-    }
-    switch e.Type {
-    case endpointNginx:
-        if e.Subdomain == "" {
-            return fmt.Errorf("subdomain cannot be empty when using nginx ingress")
+        if nu, exists := units[b.unit]; exists {
+            if du, exists := units[a.unit]; exists {
+                if nu > du {
+                    newDs.val = b.val + (a.val / math.Pow(10, float64(nu-du)))
+                    newDs.unit = b.unit
+                } else {
+                    newDs.val = (b.val / math.Pow(10, float64(du-nu))) + a.val
+                    newDs.unit = a.unit
+                }
+            }
         }
     }
-    return nil
+    return newDs
 }
 ```
 
+The function adds two data sizes, converting units if needed. The units map shows each unit is 1000x the previous (K=1000 bytes, M=1000K, etc.).
+
+---
+
+### 6.7 Write Test for addDataSize
+
 **What to do:**
 
-1. Add `TestEndpointFlags_Validate(t *testing.T)`
-2. Test cases:
-   - Nginx type with subdomain: expect nil
-   - Nginx type without subdomain: expect error
-   - Route type: expect nil (no subdomain required)
+1. Add a test function for `addDataSize`
+2. Test cases to cover:
+   - Same units: 10M + 5M should equal 15M
+   - Different units: think about what 1G + 500M should produce
+   - b is nil: should return nil
+   - a is nil: test what actually happens
+3. You'll need a helper function to compare two dataSize pointers (check if both nil, or both have same val and unit)
+4. Run: `go test ./cmd/transfer-pvc/... -run Test_addDataSize -v`
 
-3. Run: `go test ./cmd/transfer-pvc/... -run TestEndpointFlags_Validate -v`
+---
+
+## Part 7: Transfer Status
+
+The user needs to know: Is the transfer still running? Did it succeed? Did it fail? The progress tracker reports status based on what's happened so far.
+
+---
+
+### 7.1 The FailedFile Struct
+
+**Why you need to know this:** The `Progress` struct uses this to track files that failed to transfer.
+
+```go
+type FailedFile struct {
+    Name string  // Path of the file that failed
+    Err  string  // Error message
+}
+```
+
+Two fields:
+- **Name** — The file path that couldn't be transferred
+- **Err** — Why it failed (e.g., "Permission denied")
+
+---
+
+### 7.2 The types.NamespacedName Type
+
+**Why you need to know this:** The `Progress` struct uses this to identify which PVC is being transferred.
+
+`types.NamespacedName` comes from the Kubernetes client library. It's a simple struct:
+
+```go
+type NamespacedName struct {
+    Namespace string
+    Name      string
+}
+```
+
+It uniquely identifies a resource by its namespace and name.
+
+---
+
+### 7.3 The Progress Struct
+
+**Why you need to know this:** You'll test its `Status` method. You need to understand its fields.
+
+```go
+type Progress struct {
+    PVC                types.NamespacedName  // Which PVC (from 7.2)
+    TransferPercentage *int64                // 0-100, nil if not started
+    TransferRate       *dataSize             // Speed (from 6.3)
+    TransferredData    *dataSize             // Amount moved (from 6.3)
+    TotalFiles         *int64                // Total file count
+    TransferredFiles   int64                 // Files successfully moved
+    ExitCode           *int32                // rsync exit code, nil if still running
+    FailedFiles        []FailedFile          // Files that failed (from 7.1)
+    Errors             []string              // Error messages
+    retries            *int                  // Number of retry attempts (private)
+    startedAt          time.Time             // When transfer started
+}
+```
+
+Key fields for determining status:
+- **TransferPercentage** — How complete the transfer is
+- **ExitCode** — rsync's exit code (nil = still running, 0 = success, other = failure)
+- **TransferredFiles** — Number of files successfully transferred
+- **TransferredData** — Amount of data moved
+- **TotalFiles** — Total number of files to transfer
+
+---
+
+### 7.4 Why Are Some Fields Pointers?
+
+**Why you need to know this:** The Progress struct has both pointer fields (`*int64`) and non-pointer fields (`int64`). You need to understand the difference to write correct tests.
+
+Look at `TransferPercentage *int64` vs `TransferredFiles int64`.
+
+`*int64` is a pointer. It can be:
+- `nil` — We don't know the value yet
+- A pointer to an actual number
+
+`int64` (no pointer) always has a value. In Go, uninitialized integers are 0.
+
+Using pointers lets you distinguish "we know it's 0" from "we don't know yet."
+
+In the Progress struct:
+- `TransferPercentage *int64` — We don't know until rsync reports it. nil means "not yet known."
+- `TransferredFiles int64` — Starts at 0, which is meaningful (0 files transferred so far).
+
+When writing tests, you'll need to create pointer values. You can't write `&100` (address of a literal). Instead:
+```go
+int100 := int64(100)
+progress.TransferPercentage = &int100
+```
+
+---
+
+### 7.5 The status Type and Constants
+
+**Why you need to know this:** The `Status` method returns one of these values.
+
+```go
+type status string
+
+const (
+    succeeded          status = "Succeeded"
+    failed             status = "Failed"
+    partiallyFailed    status = "Partially failed"
+    preparing          status = "Preparing"
+    transferInProgress status = "Transfer in-progress"
+    finishingUp        status = "Finishing up"
+)
+```
+
+Six possible states:
+- **preparing** — Transfer hasn't really started yet
+- **transferInProgress** — Actively copying files
+- **finishingUp** — Reached 100% but rsync hasn't exited yet
+- **succeeded** — Completed successfully (exit code 0)
+- **failed** — Nothing transferred, non-zero exit code
+- **partiallyFailed** — Some files transferred, but errors occurred
+
+---
+
+### 7.6 The Status Method
+
+**Why you need to know this:** This is the method you'll test. It determines the current status based on the Progress fields.
+
+```go
+func (p *Progress) Status() status {
+    if p.ExitCode != nil {
+        if *p.ExitCode == 0 {
+            int100 := int64(100)
+            p.TransferPercentage = &int100
+            return succeeded
+        }
+        if p.TransferredFiles == 0 &&
+            p.TransferredData.val == 0 &&
+            p.TotalFiles == nil {
+            return failed
+        }
+        return partiallyFailed
+    } else {
+        if p.TransferPercentage == nil {
+            return preparing
+        }
+        if *p.TransferPercentage >= 100 {
+            return finishingUp
+        }
+    }
+    return transferInProgress
+}
+```
+
+The logic:
+1. If ExitCode is set (transfer finished):
+   - Exit code 0 = succeeded
+   - Exit code non-zero with nothing transferred = failed
+   - Exit code non-zero with some data transferred = partiallyFailed
+2. If ExitCode is NOT set (still running):
+   - No percentage yet = preparing
+   - Percentage >= 100 = finishingUp
+   - Otherwise = transferInProgress
+
+---
+
+### 7.7 Write Test for Status
+
+**What to do:**
+
+1. Add a test function for `Progress.Status`
+2. Think through each status and what Progress fields would produce it:
+   - succeeded: exit code is 0
+   - failed: exit code is non-zero, but nothing was transferred (TransferredFiles=0, TransferredData.val=0, TotalFiles=nil)
+   - partiallyFailed: exit code is non-zero, but some files were transferred
+   - preparing: no exit code yet, no percentage yet
+   - finishingUp: no exit code yet, but percentage is 100 or more
+   - transferInProgress: no exit code, percentage is set but under 100
+3. For each case, create a Progress struct with the right fields set
+4. You'll need helper functions to create pointers to int32 and int64 values
+5. Run: `go test ./cmd/transfer-pvc/... -run Test_Progress_Status -v`
+
+---
+
+## Part 8: Parsing Rsync Logs
+
+The existing test file has tests for `parseRsyncLogs`. Let's understand and extend them.
+
+---
+
+### 8.1 Review Existing Tests
+
+**Open:** `cmd/transfer-pvc/progress_test.go`
+
+The `Test_parseRsyncLogs` function tests parsing of rsync output. Study how it:
+- Creates raw log strings (stdout, stderr)
+- Calls `parseRsyncLogs`
+- Checks the returned Progress struct fields
+- Verifies the status
+- Checks for unprocessed text
+
+---
+
+### 8.2 Add Test for Error Parsing
+
+The parser extracts error messages from rsync output using regex patterns. One pattern catches lines like `@ERROR: access denied`.
+
+**What to do:**
+
+1. Add a test case to `Test_parseRsyncLogs` that includes `@ERROR:` lines in stdout
+2. Verify the `Errors` slice in the returned Progress contains the error messages
+3. Add an assertion to the test loop that checks the Errors field
+4. Run: `go test ./cmd/transfer-pvc/... -run Test_parseRsyncLogs -v`
+
+---
+
+### 8.3 Add Test for Retry Detection
+
+The parser detects when rsync retries using a regex that matches lines like `Syncronization failed. Retrying in 5 seconds. Retry 2/3`.
+
+**What to do:**
+
+1. Add a test case with a retry message in stdout
+2. The `retries` field is private, so you can't directly check it. For now, verify the test doesn't panic and returns the expected status.
+3. Run: `go test ./cmd/transfer-pvc/... -run Test_parseRsyncLogs -v`
+
+---
+
+## Part 9: The Completed Method
+
+How does code know when to stop waiting for a transfer? It needs to know if the status represents a "done" state.
+
+---
+
+### 9.1 The Completed Method
+
+**Why you need to know this:** This helper method answers "is the transfer done?" regardless of whether it succeeded or failed.
+
+```go
+func (s status) Completed() bool {
+    return s == succeeded || s == failed || s == partiallyFailed
+}
+```
+
+Returns true for the three "done" states (succeeded, failed, partiallyFailed), false for the three "still going" states (preparing, transferInProgress, finishingUp).
+
+---
+
+### 9.2 Write the Test
+
+**What to do:**
+
+1. Add a test function for `status.Completed`
+2. Test all six status values:
+   - succeeded: should return true
+   - failed: should return true
+   - partiallyFailed: should return true
+   - preparing: should return false
+   - transferInProgress: should return false
+   - finishingUp: should return false
+3. Run: `go test ./cmd/transfer-pvc/... -run Test_status_Completed -v`
 
 ---
 
 ## Summary
 
 You learned:
-- What PersistentVolumeClaims are (storage requests in Kubernetes)
-- How multi-cluster operations work (contexts, clients)
-- The Progress struct and its pointer fields
-- The dataSize struct for representing byte amounts
-- How rsync output is parsed
-- Status state machine logic
-- Testing functions that return errors
-- Using subtests with `t.Run`
-- (Optional) Using fake clients for functions that need Kubernetes
+- What PVCs are (persistent storage in Kubernetes)
+- How multi-cluster operations work (kubeconfig and contexts)
+- Source-to-destination name mapping format
+- How command-line flags become struct values (Cobra binding)
+- Kubernetes 63-character name limit and how crane handles it
+- Endpoint types (nginx-ingress vs route) and their validation
+- How rsync output is parsed into structured progress data
+- The difference between pointer and non-pointer fields
+- Transfer status states and their transitions
 
 You wrote tests for:
-- `parseRsyncLogs` (additional case)
-- `Progress.Status()`
-- `addDataSize`
-- `newDataSize`
 - `getValidatedResourceName`
-- `PvcFlags.Validate()`
-- `EndpointFlags.Validate()`
-- (Optional) `getNodeNameForPVC`
+- `EndpointFlags.Validate`
+- `PvcFlags.Validate`
+- `newDataSize`
+- `addDataSize`
+- `Progress.Status`
+- `status.Completed`
+- Extended `parseRsyncLogs` tests
 
 ---
 
@@ -760,15 +931,5 @@ You wrote tests for:
 
 1. Run all transfer-pvc tests: `go test ./cmd/transfer-pvc/... -v`
 2. Make sure they pass
-3. Run all tests across the project: `go test ./... -v`
-
-You've now covered unit tests for all three commands: apply, export, and transfer-pvc. You've learned:
-- Go testing basics
-- Table-driven tests
-- Kubernetes concepts (resources, namespaces, RBAC, PVCs)
-- Testing pure functions
-- Handling pointers and nil values
-- Error case testing
-- (Optional) Mocking Kubernetes clients
-
-Continue practicing by finding untested functions and writing tests for them. Each test deepens your understanding of both Go and Kubernetes.
+3. Consider edge cases you might have missed
+4. Look at the functions that interact with Kubernetes clients — those require mocking (advanced topic from Guide 2 Part 7)

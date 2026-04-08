@@ -40,6 +40,7 @@ func Test_parseRsyncLogs(t *testing.T) {
 	int130 := int64(130)
 	int6 := int64(6)
 	int49 := int64(49948)
+	int100 := int64(100)
 	tests := []struct {
 		name            string
 		stdout          string
@@ -91,6 +92,20 @@ Number of regular files transferred: 130
 			},
 			wantStatus:      preparing,
 			wantUnProcessed: "",
+		},
+		{
+			name: `rsync reported 100'%' progress`,
+		 	stdout: `3M   3%  105.06MB/s    0:00:00 (xfr#1, to-chk=7/8)
+6M   6%   86.40MB/s    0:00:00 (xfr#2, to-chk=5/8)
+100M   100%   90.40MB/s    0:00:00 (xfr#3, to-chk=8/8`,
+			want: Progress{
+				TransferPercentage: &int100,
+				TransferRate: &dataSize{
+					val: 100,
+					unit: "M",
+				},
+
+			},
 		},
 		{
 			name: "unprocessed line test",
