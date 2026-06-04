@@ -3,6 +3,8 @@ package framework
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/konveyor/crane/e2e-tests/utils"
@@ -154,5 +156,54 @@ func checkAndLogStageFiles(stage, dir string) error {
 		return fmt.Errorf("expected crane %s to produce files in %s", stage, dir)
 	}
 	log.Printf("%s files:\n%s\n", stage, files)
+	return nil
+}
+
+func NonAdminApplyOutput(kubectlTgt KubectlRunner, path string, namespace string) error {
+	outputNamespacedir := filepath.Join(path, "resources", namespace)
+	_, err := os.Stat(outputNamespacedir)
+	if err != nil {
+		log.Printf("failures: %v \n", err)
+		return err
+	}
+	err = kubectlTgt.ApplyDir(outputNamespacedir)
+	return err
+}
+
+func CreateNamespaceAndDryRun(kubectl KubectlRunner, namespace, outputDir string) error {
+	log.Printf("Creating namespace %s on target", namespace)
+	if _, err := kubectl.Run("create", "namespace", namespace); err != nil {
+		return fmt.Errorf("failed to create namespace %s: %w", namespace, err)
+	}
+	return kubectl.ValidateApplyDir(outputDir)
+}
+
+// ValidatePipelineClusterResources verifies cluster resource files exist across all pipeline stages (export, transform, apply).
+// Pass nil for transformStages to default to 10_KubernetesPlugin.
+func ValidatePipelineClusterResources(paths ScenarioPaths, namespace string, resources []string, transformStages *[]string) error {
+	exportClusterDir := filepath.Join(paths.ExportDir, "resources", namespace, "_cluster")
+	log.Printf("Validating Export _cluster directory")
+	if err := utils.AssertKindsInOutput(exportClusterDir, resources); err != nil {
+		return fmt.Errorf("Export: %w", err)
+	}
+
+	stages := []string{"10_KubernetesPlugin"}
+	if transformStages != nil && len(*transformStages) > 0 {
+		stages = *transformStages
+	}
+	for _, stage := range stages {
+		transformClusterDir := filepath.Join(paths.TransformDir, ".work", stage, "output", "_cluster")
+		log.Printf("Validating Transform(%s) _cluster directory", stage)
+		if err := utils.AssertKindsInOutput(transformClusterDir, resources); err != nil {
+			return fmt.Errorf("Transform(%s): %w", stage, err)
+		}
+	}
+
+	outputClusterDir := filepath.Join(paths.OutputDir, "resources", "_cluster")
+	log.Printf("Validating Apply _cluster directory")
+	if err := utils.AssertKindsInOutput(outputClusterDir, resources); err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+
 	return nil
 }

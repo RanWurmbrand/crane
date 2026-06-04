@@ -127,3 +127,24 @@ func CleanupScenario(tempDir string, srcApp, tgtApp K8sDeployApp) error {
 	log.Println("Cleanup completed.")
 	return nil
 }
+
+// ScenarioCleanup removes temp dirs, apps, and namespaces on both clusters. Best-effort.
+func ScenarioCleanup(paths ScenarioPaths, srcApp, tgtApp K8sDeployApp, srcKubectl, tgtKubectl KubectlRunner, namespace string) {
+	if err := CleanupScenario(paths.TempDir, srcApp, tgtApp); err != nil {
+		log.Printf("cleanup: %v", err)
+	}
+}
+
+func (s MigrationScenario) NonAdminApps() (soruceApp K8sDeployApp, targetApp K8sDeployApp) {
+	srcAppNonAdmin := s.SrcAppNonAdmin
+	tgtAppNonAdmin := s.TgtAppNonAdmin
+
+	srcAppNonAdmin.ExtraVars = map[string]any{
+		"non_admin_user": "true",
+	}
+	tgtAppNonAdmin.ExtraVars = map[string]any{
+		"non_admin_user": "true",
+	}
+
+	return srcAppNonAdmin, tgtAppNonAdmin
+}
