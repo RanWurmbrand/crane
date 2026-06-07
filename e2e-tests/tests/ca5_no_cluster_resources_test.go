@@ -32,25 +32,25 @@ var _ = Describe("Cluster-level export control", func() {
 			ScenarioCleanup(paths, srcApp, tgtApp, kubectlSrc, kubectlTgt, namespace)
 		})
 
-		By("Prepare source app")
+		By("Deploying namespace-only app on source cluster")
 		Expect(PrepareSourceApp(srcApp, kubectlSrc)).NotTo(HaveOccurred())
 
-		By("Wait for source quiesce")
+		By("Waiting for source pods and endpoints to drain")
 		WaitForSourceQuiesce(kubectlSrc, namespace, "app="+appName, serviceName)
 
-		By("Run crane export/transform/apply pipeline")
+		By("Running crane export, transform, apply")
 		Expect(RunPipeline(&runner, namespace, paths)).NotTo(HaveOccurred())
 
-		By("Verify no cluster resources in export")
+		By("Verifying no cluster-scoped resources in export directory")
 		Expect(AssertNoClusterResources(paths.ExportDir)).NotTo(HaveOccurred())
 
-		By("Verify no cluster resources in output")
+		By("Verifying no cluster-scoped resources in output directory")
 		Expect(AssertNoClusterResources(paths.OutputDir)).NotTo(HaveOccurred())
 
-		By("Apply output to target")
+		By("Applying migrated manifests to target cluster")
 		Expect(ApplyOutputToTarget(kubectlTgt, namespace, paths.OutputDir)).NotTo(HaveOccurred())
 
-		By("Scale target deployment and validate")
+		By("Scaling target deployment and validating app")
 		ScaleAndValidateTargetApp(kubectlTgt, tgtApp, namespace, appName)
 	})
 

@@ -10,11 +10,10 @@ import (
 )
 
 var _ = Describe("Namespace-admin cluster-level migration", func() {
-	It("[NA-1] Should migrate workload with split apply: namespace-admin + cluster-admin", Label("namespace-admin"), func() {
+	It("[NA-4] Should migrate namespace-only workload as namespace-admin without split apply", Label("namespace-admin"), func() {
 		appName := "simple-nginx-nopv"
 		namespace := "simple-nginx-nopv"
 		serviceName := "my-" + appName
-		subject := "--serviceaccount=" + namespace + ":default"
 		scenario := NewMigrationScenario(
 			appName,
 			namespace,
@@ -23,9 +22,6 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 			config.SourceContext,
 			config.TargetContext,
 		)
-		clusterRoleBindingName := "crane-e2e-pod-reader-binding"
-		clusterRoleName := "crane-e2e-pod-reader"
-		forbiddenResourcesPatterns := []string{"ClusterRole_*.yaml", "ClusterRoleBinding_*.yaml"}
 		if scenario.KubectlSrcNonAdmin.Context == "" {
 			Skip("source-nonadmin-context is required for non-admin role migration test")
 		}
@@ -35,7 +31,7 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		srcAppNonAdmin, tgtAppNonAdmin := NonAdminApps(scenario)
 		kubectlSrc := scenario.KubectlSrc
 		kubectlTgt := scenario.KubectlTgt
-		paths, err := NewScenarioPaths("crane-na1-*")
+		paths, err := NewScenarioPaths("crane-na4-*")
 		runner := scenario.CraneNonAdmin
 		Expect(err).NotTo(HaveOccurred())
 
@@ -45,26 +41,12 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 
 		DeferCleanup(rbacCleanup)
 		DeferCleanup(func() {
-			ResourceCleanup([]KubectlRunner{kubectlSrc, kubectlTgt}, []Deletable{
-				ClusterRoleBinding{Name: clusterRoleBindingName},
-				ClusterRole{Name: clusterRoleName},
-			})
-		})
-		DeferCleanup(func() {
 			ScenarioCleanup(paths, srcAppNonAdmin, tgtAppNonAdmin, kubectlSrc, kubectlTgt, namespace)
 		})
 
-		By("Deploying app as namespace-admin on source cluster")
+		By("Deploying namespace-only app as namespace-admin on source cluster")
 		err = PrepareSourceApp(srcAppNonAdmin, kubectlSrcNonAdmin)
 		Expect(err).NotTo(HaveOccurred())
-
-		By("Creating ClusterRole as cluster-admin")
-		cr := ClusterRole{Name: clusterRoleName, Permission: "read"}
-		Expect(cr.Create(kubectlSrc)).NotTo(HaveOccurred())
-
-		By("Creating ClusterRoleBinding as cluster-admin")
-		crb := ClusterRoleBinding{Name: clusterRoleBindingName, ClusterRoleName: clusterRoleName, Subject: subject}
-		Expect(crb.Create(kubectlSrc)).NotTo(HaveOccurred())
 
 		By("Waiting for source pods and endpoints to drain")
 		WaitForSourceQuiesce(kubectlSrcNonAdmin, namespace, "app="+appName, serviceName)
@@ -72,20 +54,11 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		By("Running crane export, transform, apply as namespace-admin")
 		Expect(RunPipeline(&runner, namespace, paths)).NotTo(HaveOccurred())
 
-		By("Verifying cluster resources failed to export (expected for namespace-admin)")
-		err = ValidateDirResources(filepath.Join(paths.ExportDir, "failures"), forbiddenResourcesPatterns)
-		//as namespace admin we dont have privilages to export cluster resource.
-		//on that scenario export will create files on the failure folder stating what kind of resource didnt
-		Expect(err).To(HaveOccurred())
-
-		By("Applying namespace resources to target as namespace-admin")
-		Expect(NonAdminApplyOutput(kubectlTgtNonAdmin, paths.OutputDir, namespace)).NotTo(HaveOccurred())
-
 		By("Verifying no cluster resources in output _cluster directory")
 		Expect(AssertNoClusterResources(filepath.Join(paths.OutputDir, "resources", "_cluster"))).NotTo(HaveOccurred())
 
-		By("Applying cluster resources to target as cluster-admin")
-		Expect(ApplyOutputToTarget(kubectlTgt, namespace, paths.OutputDir)).NotTo(HaveOccurred())
+		By("Applying namespace resources to target as namespace-admin")
+		Expect(NonAdminApplyOutput(kubectlTgtNonAdmin, paths.OutputDir, namespace)).NotTo(HaveOccurred())
 
 		By("Scaling target deployment and validating app")
 		ScaleAndValidateTargetApp(kubectlTgtNonAdmin, tgtAppNonAdmin, namespace, appName)

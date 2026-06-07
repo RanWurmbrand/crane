@@ -38,10 +38,10 @@ var _ = Describe("Cluster-level export filtering", func() {
 		paths, err := NewScenarioPaths("crane-ca6-*")
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
-			ClusterResourceCleanup(kubectlSrc, kubectlTgt, []ClusterResource{
-				{Kind: "clusterrolebinding", Name: readClusterRoleBindingName},
-				{Kind: "clusterrole", Name: readClusterRole},
-				{Kind: "clusterrole", Name: writeClusterRole},
+			ResourceCleanup([]KubectlRunner{kubectlSrc, kubectlTgt}, []Deletable{
+				ClusterRoleBinding{Name: readClusterRoleBindingName},
+				ClusterRole{Name: readClusterRole},
+				ClusterRole{Name: writeClusterRole},
 			})
 		})
 
@@ -49,32 +49,34 @@ var _ = Describe("Cluster-level export filtering", func() {
 			ScenarioCleanup(paths, srcApp, tgtApp, kubectlSrc, kubectlTgt, namespace)
 		})
 
-		By("Prepare source app")
+		By("Deploying app with ServiceAccount on source cluster")
 		prepareSrcErr := PrepareSourceApp(srcApp, kubectlSrc)
 		Expect(prepareSrcErr).NotTo(HaveOccurred())
 
-		By("Create Read ClusterRole on source")
-		Expect(CrateCrAndValidate(kubectlSrc, "read", readClusterRole)).NotTo(HaveOccurred())
+		By("Creating ClusterRole with pod read permissions")
+		readCR := ClusterRole{Name: readClusterRole, Permission: "read"}
+		Expect(readCR.Create(kubectlSrc)).NotTo(HaveOccurred())
 
-		By("Create Write ClusterRole on source")
-		Expect(CrateCrAndValidate(kubectlSrc, "write", writeClusterRole)).NotTo(HaveOccurred())
+		By("Creating orphan ClusterRole with pod write permissions (no CRB)")
+		writeCR := ClusterRole{Name: writeClusterRole, Permission: "write"}
+		Expect(writeCR.Create(kubectlSrc)).NotTo(HaveOccurred())
 
-		By("Create the read ClusterRoleBinding on source")
-		crbErr := CrateAndValidateCrb(kubectlSrc, namespace, readClusterRoleBindingName, readClusterRole, subject)
-		Expect(crbErr).NotTo(HaveOccurred())
+		By("Creating ClusterRoleBinding linking read ClusterRole to ServiceAccount")
+		readCRB := ClusterRoleBinding{Name: readClusterRoleBindingName, ClusterRoleName: readClusterRole, Subject: subject}
+		Expect(readCRB.Create(kubectlSrc)).NotTo(HaveOccurred())
 
-		By("Wait for source quiesce")
+		By("Waiting for source pods and endpoints to drain")
 		WaitForSourceQuiesce(kubectlSrc, namespace, "app="+appName, serviceName)
 
-		By("Running Crane Pipeline")
+		By("Running crane export, transform, apply")
 		Expect(RunPipeline(&runner, namespace, paths)).NotTo(HaveOccurred())
 
-		By("Verify that Orphan ClusterRole Failed to be exported")
+		By("Verifying orphan ClusterRole is not in export _cluster directory")
 		exportClusterPath := filepath.Join(paths.ExportDir, "resources", namespace, "_cluster")
 		//we dont expect to find the orphan clusterRole on the export dir.
 		Expect(ValidateDirResources(exportClusterPath, orphanResource)).To(HaveOccurred())
 
-		By("Verify that Realted ClusterRole being be exported across all stages")
+		By("Verifying linked ClusterRole and ClusterRoleBinding exist in export, transform, and output")
 		Expect(ValidatePipelineClusterResources(paths, namespace, relatedResources, nil)).NotTo(HaveOccurred())
 	})
 })

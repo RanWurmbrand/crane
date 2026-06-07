@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"log"
+	"os"
 	"path/filepath"
 
 	"github.com/konveyor/crane/e2e-tests/config"
@@ -10,7 +12,7 @@ import (
 )
 
 var _ = Describe("Namespace-admin cluster-level migration", func() {
-	It("[NA-1] Should migrate workload with split apply: namespace-admin + cluster-admin", Label("namespace-admin"), func() {
+	It("[NA-6] Should produce consistent output when export has missing cluster resources", Label("namespace-admin"), func() {
 		appName := "simple-nginx-nopv"
 		namespace := "simple-nginx-nopv"
 		serviceName := "my-" + appName
@@ -25,7 +27,7 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		)
 		clusterRoleBindingName := "crane-e2e-pod-reader-binding"
 		clusterRoleName := "crane-e2e-pod-reader"
-		forbiddenResourcesPatterns := []string{"ClusterRole_*.yaml", "ClusterRoleBinding_*.yaml"}
+		forbiddenResourcesPatterns := []string{"clusterroles.yaml", "clusterrolebindings.yaml"}
 		if scenario.KubectlSrcNonAdmin.Context == "" {
 			Skip("source-nonadmin-context is required for non-admin role migration test")
 		}
@@ -35,7 +37,7 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		srcAppNonAdmin, tgtAppNonAdmin := NonAdminApps(scenario)
 		kubectlSrc := scenario.KubectlSrc
 		kubectlTgt := scenario.KubectlTgt
-		paths, err := NewScenarioPaths("crane-na1-*")
+		paths, err := NewScenarioPaths("crane-na6-*")
 		runner := scenario.CraneNonAdmin
 		Expect(err).NotTo(HaveOccurred())
 
@@ -72,20 +74,41 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		By("Running crane export, transform, apply as namespace-admin")
 		Expect(RunPipeline(&runner, namespace, paths)).NotTo(HaveOccurred())
 
-		By("Verifying cluster resources failed to export (expected for namespace-admin)")
-		err = ValidateDirResources(filepath.Join(paths.ExportDir, "failures"), forbiddenResourcesPatterns)
-		//as namespace admin we dont have privilages to export cluster resource.
-		//on that scenario export will create files on the failure folder stating what kind of resource didnt
-		Expect(err).To(HaveOccurred())
+		By("Verifying cluster resource failures were recorded in failures directory")
+		failuresDir := filepath.Join(paths.ExportDir, "failures", namespace)
+		Expect(ValidateDirResources(failuresDir, forbiddenResourcesPatterns)).NotTo(HaveOccurred())
+
+		By("Verifying output _cluster files match transform _cluster files")
+		outputClusterPath := filepath.Join(paths.OutputDir, "resources", "_cluster")
+		if _, err := os.Stat(outputClusterPath); os.IsNotExist(err) {
+			log.Printf("No _cluster directory in output (expected for thin export)")
+		} else {
+			files, err := filepath.Glob(filepath.Join(outputClusterPath, "*.yaml"))
+			Expect(err).NotTo(HaveOccurred())
+			log.Printf("output _cluster contains %d files", len(files))
+
+			transformClusterPath := filepath.Join(paths.TransformDir, ".work", "10_KubernetesPlugin", "output", "_cluster")
+			for _, outputFile := range files {
+				baseName := filepath.Base(outputFile)
+				transformFile := filepath.Join(transformClusterPath, baseName)
+				Expect(transformFile).To(BeAnExistingFile(),
+					"output file %s has no corresponding transform file", baseName)
+			}
+		}
+
+		By("Verifying namespace resources exist in output directory")
+		namespaceDir := filepath.Join(paths.OutputDir, "resources", namespace)
+		Expect(namespaceDir).To(BeADirectory())
+		deploymentPattern := filepath.Join(namespaceDir, "Deployment_*.yaml")
+		matches, err := filepath.Glob(deploymentPattern)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(matches).NotTo(BeEmpty(), "expected Deployment in namespace output")
+
+		By("Creating namespace on target cluster")
+		Expect(kubectlTgt.CreateNamespace(namespace)).NotTo(HaveOccurred())
 
 		By("Applying namespace resources to target as namespace-admin")
-		Expect(NonAdminApplyOutput(kubectlTgtNonAdmin, paths.OutputDir, namespace)).NotTo(HaveOccurred())
-
-		By("Verifying no cluster resources in output _cluster directory")
-		Expect(AssertNoClusterResources(filepath.Join(paths.OutputDir, "resources", "_cluster"))).NotTo(HaveOccurred())
-
-		By("Applying cluster resources to target as cluster-admin")
-		Expect(ApplyOutputToTarget(kubectlTgt, namespace, paths.OutputDir)).NotTo(HaveOccurred())
+		Expect(kubectlTgtNonAdmin.ApplyDir(filepath.Join(paths.OutputDir, "resources", namespace))).NotTo(HaveOccurred())
 
 		By("Scaling target deployment and validating app")
 		ScaleAndValidateTargetApp(kubectlTgtNonAdmin, tgtAppNonAdmin, namespace, appName)

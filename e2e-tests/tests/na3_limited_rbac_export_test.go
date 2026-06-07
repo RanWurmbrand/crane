@@ -10,7 +10,7 @@ import (
 )
 
 var _ = Describe("Namespace-admin cluster-level migration", func() {
-	It("[NA-1] Should migrate workload with split apply: namespace-admin + cluster-admin", Label("namespace-admin"), func() {
+	It("[NA-3] Should export namespace resources and record failures under limited RBAC", Label("namespace-admin"), func() {
 		appName := "simple-nginx-nopv"
 		namespace := "simple-nginx-nopv"
 		serviceName := "my-" + appName
@@ -25,7 +25,7 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		)
 		clusterRoleBindingName := "crane-e2e-pod-reader-binding"
 		clusterRoleName := "crane-e2e-pod-reader"
-		forbiddenResourcesPatterns := []string{"ClusterRole_*.yaml", "ClusterRoleBinding_*.yaml"}
+		forbiddenResourcesPatterns := []string{"clusterroles.yaml", "clusterrolebindings.yaml"}
 		if scenario.KubectlSrcNonAdmin.Context == "" {
 			Skip("source-nonadmin-context is required for non-admin role migration test")
 		}
@@ -35,12 +35,12 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		srcAppNonAdmin, tgtAppNonAdmin := NonAdminApps(scenario)
 		kubectlSrc := scenario.KubectlSrc
 		kubectlTgt := scenario.KubectlTgt
-		paths, err := NewScenarioPaths("crane-na1-*")
+		paths, err := NewScenarioPaths("crane-na3-*")
 		runner := scenario.CraneNonAdmin
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Granting namespace-admin permissions to non-admin user on source and target")
-		kubectlSrcNonAdmin, kubectlTgtNonAdmin, rbacCleanup, err := SetupNamespaceAdminUsersForScenario(scenario, namespace)
+		kubectlSrcNonAdmin, _, rbacCleanup, err := SetupNamespaceAdminUsersForScenario(scenario, namespace)
 		Expect(err).NotTo(HaveOccurred())
 
 		DeferCleanup(rbacCleanup)
@@ -72,23 +72,9 @@ var _ = Describe("Namespace-admin cluster-level migration", func() {
 		By("Running crane export, transform, apply as namespace-admin")
 		Expect(RunPipeline(&runner, namespace, paths)).NotTo(HaveOccurred())
 
-		By("Verifying cluster resources failed to export (expected for namespace-admin)")
-		err = ValidateDirResources(filepath.Join(paths.ExportDir, "failures"), forbiddenResourcesPatterns)
-		//as namespace admin we dont have privilages to export cluster resource.
-		//on that scenario export will create files on the failure folder stating what kind of resource didnt
-		Expect(err).To(HaveOccurred())
-
-		By("Applying namespace resources to target as namespace-admin")
-		Expect(NonAdminApplyOutput(kubectlTgtNonAdmin, paths.OutputDir, namespace)).NotTo(HaveOccurred())
-
-		By("Verifying no cluster resources in output _cluster directory")
-		Expect(AssertNoClusterResources(filepath.Join(paths.OutputDir, "resources", "_cluster"))).NotTo(HaveOccurred())
-
-		By("Applying cluster resources to target as cluster-admin")
-		Expect(ApplyOutputToTarget(kubectlTgt, namespace, paths.OutputDir)).NotTo(HaveOccurred())
-
-		By("Scaling target deployment and validating app")
-		ScaleAndValidateTargetApp(kubectlTgtNonAdmin, tgtAppNonAdmin, namespace, appName)
+		By("Verifying cluster resources are recorded in failures directory")
+		err = ValidateDirResources(filepath.Join(paths.ExportDir, "failures", namespace), forbiddenResourcesPatterns)
+		Expect(err).NotTo(HaveOccurred())
 
 	})
 

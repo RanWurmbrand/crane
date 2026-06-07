@@ -11,16 +11,15 @@ import (
 )
 
 var _ = Describe("Cluster-level RBAC export", func() {
-	It("[CA-3] Should export two ClusterRoles and two ClusterRoleBindings for one Deployment", Label("cluster-admin"), func() {
+	It("[CA-4c] Should export CRB with Group subject referencing namespace ServiceAccounts", Label("cluster-admin"), func() {
 		appName := "nginx-with-serviceaccount"
 		namespace := "simple-nginx-nopv"
 		serviceName := "my-" + appName
-		saName := "nginx-sa"
-		readClusterRole := "crane-e2e-pod-reader"
-		writeClusterRole := "crane-e2e-pod-writer"
-		readClusterRoleBindingName := "reader-crane-e2e-pod-binding"
-		writeClusterRoleBindingName := "writer-crane-e2e-pod-binding"
-		subject := "--serviceaccount=" + namespace + ":" + saName
+		//saName := "nginx-sa"
+		subject := "--group=system:serviceaccounts:" + namespace
+		subjectName := "system:serviceaccounts:" + namespace
+		crbName := "crane-e2e-pod-reader-binding"
+		clusterRoleName := "crane-e2e-pod-reader"
 		scenario := NewMigrationScenario(
 			appName,
 			namespace,
@@ -33,17 +32,15 @@ var _ = Describe("Cluster-level RBAC export", func() {
 		tgtApp := scenario.TgtApp
 		kubectlSrc := scenario.KubectlSrc
 		kubectlTgt := scenario.KubectlTgt
-
-		paths, err := NewScenarioPaths("crane-ca3-*")
 		runner := scenario.Crane
+		paths, err := NewScenarioPaths("crane-ca4c-*")
 		resourcesPatterns := []string{"ClusterRole_*.yaml", "ClusterRoleBinding_*.yaml"}
 		Expect(err).NotTo(HaveOccurred())
+
 		DeferCleanup(func() {
 			ResourceCleanup([]KubectlRunner{kubectlSrc, kubectlTgt}, []Deletable{
-				ClusterRoleBinding{Name: readClusterRoleBindingName},
-				ClusterRoleBinding{Name: writeClusterRoleBindingName},
-				ClusterRole{Name: readClusterRole},
-				ClusterRole{Name: writeClusterRole},
+				ClusterRoleBinding{Name: crbName},
+				ClusterRole{Name: clusterRoleName},
 			})
 		})
 
@@ -55,20 +52,12 @@ var _ = Describe("Cluster-level RBAC export", func() {
 		Expect(PrepareSourceApp(srcApp, kubectlSrc)).NotTo(HaveOccurred())
 
 		By("Creating ClusterRole with pod read permissions")
-		readCR := ClusterRole{Name: readClusterRole, Permission: "read"}
-		Expect(readCR.Create(kubectlSrc)).NotTo(HaveOccurred())
+		cr := ClusterRole{Name: clusterRoleName, Permission: "read"}
+		Expect(cr.Create(kubectlSrc)).NotTo(HaveOccurred())
 
-		By("Creating ClusterRole with pod write permissions")
-		writeCR := ClusterRole{Name: writeClusterRole, Permission: "write"}
-		Expect(writeCR.Create(kubectlSrc)).NotTo(HaveOccurred())
-
-		By("Creating ClusterRoleBinding for read ClusterRole")
-		readCRB := ClusterRoleBinding{Name: readClusterRoleBindingName, ClusterRoleName: readClusterRole, Subject: subject}
-		Expect(readCRB.Create(kubectlSrc)).NotTo(HaveOccurred())
-
-		By("Creating ClusterRoleBinding for write ClusterRole")
-		writeCRB := ClusterRoleBinding{Name: writeClusterRoleBindingName, ClusterRoleName: writeClusterRole, Subject: subject}
-		Expect(writeCRB.Create(kubectlSrc)).NotTo(HaveOccurred())
+		By("Creating ClusterRoleBinding with Group subject for namespace ServiceAccounts")
+		crb := ClusterRoleBinding{Name: crbName, ClusterRoleName: clusterRoleName, Subject: subject}
+		Expect(crb.Create(kubectlSrc)).NotTo(HaveOccurred())
 
 		By("Waiting for source pods and endpoints to drain")
 		WaitForSourceQuiesce(kubectlSrc, namespace, "app="+appName, serviceName)
@@ -82,22 +71,24 @@ var _ = Describe("Cluster-level RBAC export", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(hasFiles).To(BeFalse())
 
-		By("Verifying ClusterRoles and ClusterRoleBindings exist in export, transform, and output _cluster directories")
+		By("Verifying ClusterRole and ClusterRoleBinding exist in export, transform, and output _cluster directories")
 		Expect(ValidatePipelineClusterResources(paths, namespace, resourcesPatterns, nil)).NotTo(HaveOccurred())
 
 		By("Dry-run applying output manifests on target")
-		Expect(CreateNamespaceAndDryRun(kubectlTgt, namespace, paths.OutputDir)).NotTo(HaveOccurred())
+		Expect(kubectlTgt.CreateNamespace(namespace)).NotTo(HaveOccurred())
+		Expect(kubectlTgt.ValidateApplyDir(paths.OutputDir)).NotTo(HaveOccurred())
 
 		By("Applying migrated manifests to target cluster")
-		Expect(ApplyOutputToTarget(kubectlTgt, namespace, paths.OutputDir)).NotTo(HaveOccurred())
+		validateErr := ApplyOutputToTarget(kubectlTgt, namespace, paths.OutputDir)
+		Expect(validateErr).NotTo(HaveOccurred())
 
 		By("Scaling target deployment and validating app")
 		ScaleAndValidateTargetApp(kubectlTgt, tgtApp, namespace, appName)
 
-		By("Verifying both ClusterRoleBindings on target reference correct ClusterRoles and ServiceAccount")
+		By("Verifying ClusterRoleBinding on target references correct ClusterRole and Group subject")
 		Expect(ValidateClusterRBAC(kubectlTgt, namespace, []ExpectedClusterRoleBinding{
-			{ClusterRoleBindingName: readClusterRoleBindingName, ClusterRoleName: readClusterRole, SubjectName: saName},
-			{ClusterRoleBindingName: writeClusterRoleBindingName, ClusterRoleName: writeClusterRole, SubjectName: saName},
+			{ClusterRoleBindingName: crbName, ClusterRoleName: clusterRoleName, SubjectName: subjectName},
 		})).NotTo(HaveOccurred())
 	})
+
 })

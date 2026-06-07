@@ -6,9 +6,12 @@ import (
 )
 
 type CraneRunner struct {
-	Bin           string
-	SourceContext string
-	WorkDir       string
+	Bin              string
+	SourceContext    string
+	WorkDir          string
+	LabelSelector    string
+	CRDSkipGroups    []string
+	CRDIncludeGroups []string
 }
 
 // TransferPVCOptions contains arguments for the crane transfer-pvc command.
@@ -25,6 +28,15 @@ type TransferPVCOptions struct {
 // Export runs crane export for a namespace into the given export directory.
 func (c CraneRunner) Export(namespace, exportDir string) error {
 	args := []string{"export", "--context", c.SourceContext, "--namespace", namespace, "--export-dir", exportDir}
+	if c.LabelSelector != "" {
+		args = append(args, "--label-selector", c.LabelSelector)
+	}
+	for _, g := range c.CRDSkipGroups {
+		args = append(args, "--crd-skip-group", g)
+	}
+	for _, g := range c.CRDIncludeGroups {
+		args = append(args, "--crd-include-group", g)
+	}
 	logVerboseCommand(c.Bin, args)
 	cmd := exec.Command(c.Bin, args...)
 	cmd.Dir = c.WorkDir

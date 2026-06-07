@@ -10,34 +10,181 @@ import (
 	"github.com/onsi/gomega"
 )
 
-type ClusterResource struct {
-	Kind string
-	Name string
+type Deletable interface {
+	Delete(k KubectlRunner) error
 }
 
-// ClusterResourceCleanup deletes cluster-scoped resources (e.g. ClusterRoles, CRBs) on both clusters. Best-effort.
-func ClusterResourceCleanup(srcKubectl, tgtKubectl KubectlRunner, resources []ClusterResource) {
-	for _, k := range []KubectlRunner{srcKubectl, tgtKubectl} {
+func ResourceCleanup(clusters []KubectlRunner, resources []Deletable) {
+	for _, k := range clusters {
 		for _, r := range resources {
-			if _, err := k.Run("delete", r.Kind, r.Name, "--ignore-not-found=true"); err != nil {
-				log.Printf("cleanup: failed to delete %s %s: %v", r.Kind, r.Name, err)
+			if err := r.Delete(k); err != nil {
+				log.Printf("cleanup: %v", err)
 			}
 		}
 	}
+}
+
+type ClusterRole struct {
+	Name       string
+	Permission string
+	Label      string
+}
+
+func (cr ClusterRole) Create(k KubectlRunner) error {
+	var verbs string
+	switch cr.Permission {
+	case "write":
+		verbs = "get,list,watch,create,update,delete"
+	case "patch":
+		verbs = "get,list,watch,patch"
+	default:
+		verbs = "get,list,watch"
+	}
+	_, err := k.Run("create", "clusterrole", cr.Name, "--verb="+verbs, "--resource=pods")
+	if err != nil {
+		log.Printf("failed to create ClusterRole %s: %v", cr.Name, err)
+		return err
+	}
+	log.Printf("created %s ClusterRole %s", cr.Permission, cr.Name)
+	if cr.Label != "" {
+		_, err = k.Run("label", "clusterrole", cr.Name, cr.Label)
+		if err != nil {
+			return fmt.Errorf("failed to label ClusterRole %s: %w", cr.Name, err)
+		}
+	}
+	return nil
+}
+
+func (cr ClusterRole) Delete(k KubectlRunner) error {
+	_, err := k.Run("delete", "clusterrole", cr.Name, "--ignore-not-found=true")
+	if err != nil {
+		return fmt.Errorf("failed to delete ClusterRole %s: %w", cr.Name, err)
+	}
+	return nil
+}
+
+type ClusterRoleBinding struct {
+	Name            string
+	ClusterRoleName string
+	Subject         string
+	Label           string
+}
+
+func (crb ClusterRoleBinding) Create(k KubectlRunner) error {
+	_, err := k.Run("create", "clusterrolebinding", crb.Name, "--clusterrole="+crb.ClusterRoleName, crb.Subject)
+	if err != nil {
+		log.Printf("failed to create ClusterRoleBinding %s: %v", crb.Name, err)
+		return err
+	}
+	log.Printf("created ClusterRoleBinding %s -> ClusterRole %s", crb.Name, crb.ClusterRoleName)
+	if crb.Label != "" {
+		_, err = k.Run("label", "clusterrolebinding", crb.Name, crb.Label)
+		if err != nil {
+			return fmt.Errorf("failed to label ClusterRoleBinding %s: %w", crb.Name, err)
+		}
+	}
+	return nil
+}
+
+func (crb ClusterRoleBinding) Delete(k KubectlRunner) error {
+	_, err := k.Run("delete", "clusterrolebinding", crb.Name, "--ignore-not-found=true")
+	if err != nil {
+		return fmt.Errorf("failed to delete ClusterRoleBinding %s: %w", crb.Name, err)
+	}
+	return nil
+}
+
+type ServiceAccount struct {
+	Name      string
+	Namespace string
+	Label     string
+}
+
+func (sa ServiceAccount) Create(k KubectlRunner) error {
+	_, err := k.Run("create", "serviceaccount", sa.Name, "-n", sa.Namespace)
+	if err != nil {
+		log.Printf("failed to create ServiceAccount %s in %s: %v", sa.Name, sa.Namespace, err)
+		return err
+	}
+	log.Printf("created ServiceAccount %s in %s", sa.Name, sa.Namespace)
+	if sa.Label != "" {
+		_, err = k.Run("label", "serviceaccount", sa.Name, "-n", sa.Namespace, sa.Label)
+		if err != nil {
+			return fmt.Errorf("failed to label ServiceAccount %s: %w", sa.Name, err)
+		}
+	}
+	return nil
+}
+
+func (sa ServiceAccount) Delete(k KubectlRunner) error {
+	_, err := k.Run("delete", "serviceaccount", sa.Name, "-n", sa.Namespace, "--ignore-not-found=true")
+	if err != nil {
+		return fmt.Errorf("failed to delete ServiceAccount %s: %w", sa.Name, err)
+	}
+	return nil
+}
+
+type CustomResourceDefinition struct {
+	Name string
+	YAML string
+}
+
+func (crd CustomResourceDefinition) Create(k KubectlRunner) error {
+	_, err := k.RunWithStdin(crd.YAML, "apply", "-f", "-")
+	if err != nil {
+		log.Printf("failed to create CRD %s: %v", crd.Name, err)
+	} else {
+		log.Printf("created CRD %s", crd.Name)
+	}
+	return err
+}
+
+func (crd CustomResourceDefinition) Delete(k KubectlRunner) error {
+	_, err := k.Run("delete", "crd", crd.Name, "--ignore-not-found=true")
+	if err != nil {
+		return fmt.Errorf("failed to delete CRD %s: %w", crd.Name, err)
+	}
+	return nil
+}
+
+func (crd CustomResourceDefinition) WaitForEstablished(k KubectlRunner) error {
+	gomega.Eventually(func() (string, error) {
+		return k.Run("get", "crd", crd.Name,
+			"-o", "jsonpath={.status.conditions[?(@.type=='Established')].status}")
+	}, "30s", "2s").Should(gomega.Equal("True"))
+	log.Printf("CRD %s is Established", crd.Name)
+	return nil
+}
+
+type CustomResource struct {
+	Name      string
+	Namespace string
+	Kind      string
+	YAML      string
+}
+
+func (cr CustomResource) Create(k KubectlRunner) error {
+	_, err := k.RunWithStdin(cr.YAML, "apply", "-f", "-", "-n", cr.Namespace)
+	if err != nil {
+		log.Printf("failed to create %s %s: %v", cr.Kind, cr.Name, err)
+	} else {
+		log.Printf("created %s %s in %s", cr.Kind, cr.Name, cr.Namespace)
+	}
+	return err
+}
+
+func (cr CustomResource) Delete(k KubectlRunner) error {
+	_, err := k.Run("delete", strings.ToLower(cr.Kind), cr.Name, "-n", cr.Namespace, "--ignore-not-found=true")
+	if err != nil {
+		return fmt.Errorf("failed to delete %s %s: %w", cr.Kind, cr.Name, err)
+	}
+	return nil
 }
 
 func DeleteNameSpace(k KubectlRunner, namespace string) {
 	if _, err := k.Run("delete", "namespace", namespace, "--ignore-not-found=true", "--wait=true"); err != nil {
 		log.Printf("cleanup: failed to delete namespace %q: %v", namespace, err)
 	}
-}
-
-func CreateNameSpace(k KubectlRunner, namespace string) error {
-	_, err := k.Run("create", "namespace", namespace)
-	if err != nil {
-		log.Printf("create namespace : failed to delete namespace %q: %v", namespace, err)
-	}
-	return err
 }
 
 // ScenarioCleanup removes temp dirs, apps, and namespaces on both clusters. Best-effort.
@@ -162,20 +309,6 @@ func ValidateClusterRBAC(kubectl KubectlRunner, namespace string, bindings []Exp
 	return nil
 }
 
-// AssertNoExportFailures returns an error if any files exist in the export failures directory.
-func AssertNoExportFailures(exportDir, namespace string) error {
-	failuresDir := filepath.Join(exportDir, "failures", namespace)
-	files, err := filepath.Glob(filepath.Join(failuresDir, "*"))
-	if err != nil {
-		return fmt.Errorf("glob error checking export failures: %w", err)
-	}
-	if len(files) > 0 {
-		return fmt.Errorf("found %d export failure(s) in %s", len(files), failuresDir)
-	}
-	log.Printf("No export failures found in %s", failuresDir)
-	return nil
-}
-
 func AssertNoClusterResources(basePath string) error {
 	_, err := os.Stat(basePath)
 	if err != nil {
@@ -199,49 +332,6 @@ func AssertNoClusterResources(basePath string) error {
 	}
 	log.Printf("No cluster resources found under %s", basePath)
 	return nil
-}
-
-func CrateCrAndValidate(kubectl KubectlRunner, prem string, crName string) error {
-	var verbs string
-	switch prem {
-	case "write":
-		verbs = "get,list,watch,create,update,delete"
-	case "patch":
-		verbs = "get,list,watch,patch"
-	default:
-		verbs = "get,list,watch"
-	}
-
-	_, crErr := kubectl.Run("create", "clusterrole", crName, "--verb="+verbs, "--resource=pods")
-	if crErr == nil {
-		log.Printf("Created %s ClusterRole %s", prem, crName)
-	} else {
-		log.Printf("Failed To Created ClusterRole %s", crName)
-	}
-	return crErr
-}
-
-func CrateAndValidateCrb(kubectl KubectlRunner, namespace, clusterRoleBindingName, clusterRoleName, subject string) error {
-	_, crbErr := kubectl.Run("create", "clusterrolebinding", clusterRoleBindingName, "--clusterrole="+clusterRoleName, subject)
-
-	if crbErr == nil {
-		log.Printf("Created #1 ClusterRoleBinding %s -> ClusterRole %s (subject: %s)", clusterRoleBindingName, clusterRoleName, subject)
-
-	} else {
-		log.Printf("Failed To Created ClusterRoleBinding %s\n", clusterRoleBindingName)
-	}
-
-	return crbErr
-}
-
-func CrateAndValidateServiceAccount(kubectl KubectlRunner, saName string, namespace string) error {
-	_, err := kubectl.Run("create", "serviceaccount", saName, "-n", namespace)
-	if err == nil {
-		log.Printf("Serviceaccount %s Created on  %s\n", saName, namespace)
-	} else {
-		log.Printf("Failed To Created serviceAccount %s", saName)
-	}
-	return err
 }
 
 func NonAdminApplyOutput(kubectlTgt KubectlRunner, path string, namespace string) error {
