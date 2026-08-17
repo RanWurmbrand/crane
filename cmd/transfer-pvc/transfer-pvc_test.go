@@ -1642,7 +1642,7 @@ func TestPvcFlags_Validate(t *testing.T) {
 				Namespace: mappedNameVar{source: "src-ns", destination: "dest-ns"},
 			},
 			wantErr: true,
-			errMsg:  "destnation pvc name cannot be empty",
+			errMsg:  "destination pvc name cannot be empty",
 		},
 		{
 			name: "empty source namespace returns error",
