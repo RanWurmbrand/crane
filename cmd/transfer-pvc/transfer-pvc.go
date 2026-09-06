@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	logrusr "github.com/bombsimon/logrusr/v3"
 	"github.com/go-logr/logr"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
@@ -37,6 +36,7 @@ import (
 
 	"github.com/konveyor/crane/internal/cli"
 	"github.com/konveyor/crane/internal/flags"
+	crlog "github.com/konveyor/crane/internal/log"
 
 	"github.com/migtools/pvc-transfer/endpoint"
 	ingressendpoint "github.com/migtools/pvc-transfer/endpoint/ingress"
@@ -357,8 +357,7 @@ func (t *TransferPVCCommand) getRestConfigFromContext(ctx string) (*rest.Config,
 func (t *TransferPVCCommand) run() (retErr error) {
 	log := t.log
 	log.Infof("Starting PVC transfer: %s/%s -> %s/%s", t.PVC.Namespace.source, t.PVC.Name.source, t.PVC.Namespace.destination, t.PVC.Name.destination)
-	ctrlLogger := logrus.New()
-	logger := logrusr.New(ctrlLogger).WithName("transfer-pvc")
+	logger := crlog.InitControllerRuntimeLogger("transfer-pvc")
 
 	totalPhases := 7
 	if t.isIntraClusterSameNamespace() {
